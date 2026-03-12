@@ -517,6 +517,11 @@ export class Manager {
               ``,
               `Set done:true ONLY when the task is genuinely complete and working.`,
               `The agent saying "TASK COMPLETE" is a signal, but verify — did it actually finish?`,
+              ``,
+              `IMPORTANT: The coding agent has full access to the filesystem and terminal.`,
+              `When it says it created a file, ran a command, or verified something, trust it —`,
+              `it has real tools and executes real actions. Do NOT second-guess tool execution.`,
+              `Focus your review on logic, completeness, and correctness — not whether actions were performed.`,
             ].join("\n"),
           },
           // Feed it the conversation so it knows what happened
