@@ -449,9 +449,8 @@ export class Manager {
       console.log(`\n${C.bold}${C.blue}└──${C.reset}\n`);
       if (buf) return buf;
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
       console.log(`\n${C.bold}${C.blue}└──${C.reset}`);
-      this.log2(`${C.red}✗${C.reset} expand error: ${C.dim}${msg}${C.reset}`);
+      this.logError("expand() failed", err);
     }
 
     // Fallback — just use the raw task if the expand call fails
@@ -486,8 +485,8 @@ export class Manager {
    * If the eval LLM call fails, falls back to a generic "keep going" prompt.
    */
   private async evaluate(): Promise<Evaluation> {
-    // Send the last 4 messages (2 exchanges) to keep context small and fast
-    const tail = this.log.slice(-4);
+    // Send the full conversation log so the manager has maximum context
+    const tail = this.log;
 
     try {
       const res = await this.openai.chat.completions.create({
@@ -523,19 +522,26 @@ export class Manager {
           // Feed it recent conversation so it knows what just happened
           ...tail.map((m) => ({
             role: m.role as "user" | "assistant",
-            // Truncate to 4000 chars to keep token usage low
-            content: m.content.slice(0, 4000),
+            content: m.content,
           })),
         ],
-        response_format: { type: "json_object" },
+        response_format: { type: "json_object" as const },
         temperature: 0.3,
       });
 
-      const text = res.choices[0]?.message?.content;
-      if (text) return JSON.parse(text) as Evaluation;
+      let text = res.choices[0]?.message?.content;
+      if (text) {
+        // Strip markdown code fences if the model wraps JSON in ```json ... ```
+        text = text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/, "").trim();
+        try {
+          return JSON.parse(text) as Evaluation;
+        } catch {
+          this.log2(`${C.red}✗${C.reset} JSON parse failed. Raw response:`);
+          console.log(`${C.dim}${text.slice(0, 500)}${text.length > 500 ? "…" : ""}${C.reset}`);
+        }
+      }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log2(`${C.red}✗${C.reset} eval error: ${C.dim}${msg}${C.reset}`);
+      this.logError("evaluate() failed", err);
     }
 
     // Fallback if the eval LLM fails — don't stall, just tell the agent to continue
@@ -590,6 +596,34 @@ export class Manager {
   /** Prints a styled [oam] log line to the terminal */
   private log2(msg: string): void {
     console.log(`${C.bold}${C.brightCyan}[oam]${C.reset} ${msg}`);
+  }
+
+  /** Verbose error logger — dumps everything useful for debugging API failures */
+  private logError(label: string, err: unknown): void {
+    this.log2(`${C.red}✗ ${label}${C.reset}`);
+
+    if (err instanceof Error) {
+      console.log(`${C.red}  message:${C.reset}  ${err.message}`);
+      // OpenAI SDK errors have status, code, type, headers etc.
+      const e = err as unknown as Record<string, unknown>;
+      if (e.status) console.log(`${C.red}  status:${C.reset}   ${e.status}`);
+      if (e.code) console.log(`${C.red}  code:${C.reset}     ${e.code}`);
+      if (e.type) console.log(`${C.red}  type:${C.reset}     ${e.type}`);
+      if (e.param) console.log(`${C.red}  param:${C.reset}    ${e.param}`);
+      // OpenRouter nests provider error details in error.error
+      const nested = e.error as Record<string, unknown> | undefined;
+      if (nested) {
+        if (nested.message) console.log(`${C.red}  provider:${C.reset} ${nested.message}`);
+        if (nested.code) console.log(`${C.red}  p.code:${C.reset}   ${nested.code}`);
+        if (nested.metadata) console.log(`${C.red}  metadata:${C.reset} ${C.dim}${JSON.stringify(nested.metadata)}${C.reset}`);
+      }
+      if (err.stack) {
+        const frames = err.stack.split("\n").slice(1, 4).map((l) => l.trim());
+        console.log(`${C.dim}  ${frames.join("\n  ")}${C.reset}`);
+      }
+    } else {
+      console.log(`${C.red}  raw:${C.reset} ${C.dim}${JSON.stringify(err, null, 2)}${C.reset}`);
+    }
   }
 
   /** Prints a labeled multi-line block so prompts are easy to spot in the terminal */
