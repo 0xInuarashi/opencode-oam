@@ -1,0 +1,23 @@
+{
+  "name": "oam",
+  "version": "0.1.0",
+  "description": "OpenCode Agent Manager",
+  "type": "module",
+  "bin": {
+    "oam": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "openai": "^4.86.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
