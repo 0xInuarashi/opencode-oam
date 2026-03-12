@@ -663,8 +663,10 @@ export class Manager {
         let text = msg.content;
         if (text) {
           text = text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/, "").trim();
+          const jsonMatch = text.match(/\{[\s\S]*"done"\s*:[\s\S]*\}/);
+          const jsonStr = jsonMatch ? jsonMatch[0] : text;
           try {
-            return JSON.parse(text) as Evaluation;
+            return JSON.parse(jsonStr) as Evaluation;
           } catch {
             this.log2(`${C.red}✗${C.reset} JSON parse failed. Raw response:`);
             console.log(`${C.dim}${text.slice(0, 500)}${text.length > 500 ? "…" : ""}${C.reset}`);
