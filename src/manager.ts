@@ -501,18 +501,6 @@ export class Manager {
     {
       type: "function",
       function: {
-        name: "cat",
-        description: "Read the contents of a file.",
-        parameters: {
-          type: "object",
-          properties: { path: { type: "string", description: "File path (relative to cwd)" } },
-          required: ["path"],
-        },
-      },
-    },
-    {
-      type: "function",
-      function: {
         name: "find",
         description: "Find files matching a name pattern. Returns matching paths (max 50 results).",
         parameters: {
@@ -557,9 +545,6 @@ export class Manager {
       switch (name) {
         case "ls":
           cmd = `ls -la ${JSON.stringify(args.path || ".")}`;
-          break;
-        case "cat":
-          cmd = `cat ${JSON.stringify(args.path)}`;
           break;
         case "find":
           cmd = `find . -name ${JSON.stringify(args.pattern)} -maxdepth 5 | head -50`;
