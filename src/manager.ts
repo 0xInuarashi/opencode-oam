@@ -23,6 +23,8 @@
 
 import OpenAI from "openai";
 import { execSync } from "child_process";
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { join } from "path";
 import { ACPClient } from "./acp.js";
 
 /** Options passed in from the CLI to configure a job */
@@ -30,6 +32,8 @@ export interface ManagerOptions {
   task: string;
   cwd: string;
   model?: string;
+  agentModel?: string;
+  reasoning?: string;
   maxTurns?: number;
   debug?: boolean;
 }
@@ -110,11 +114,19 @@ export class Manager {
   /** History of all turns for the final progress report */
   private history: TurnRecord[] = [];
 
+  private debug: boolean;
+
+  private agentModel: string | undefined;
+  private reasoning: string;
+
   constructor(opts: ManagerOptions) {
     this.task = opts.task;
     this.cwd = opts.cwd;
     this.model = opts.model || process.env.OAM_MODEL || "openai/gpt-4o-mini";
     this.maxTurns = opts.maxTurns ?? 50;
+    this.debug = opts.debug ?? false;
+    this.agentModel = opts.agentModel || process.env.OAM_AGENT_MODEL;
+    this.reasoning = opts.reasoning || process.env.OAM_REASONING || "high";
 
     // Point the OpenAI SDK at OpenRouter's API.
     // We pass the key explicitly so the SDK doesn't fall back to OPENAI_API_KEY.
@@ -281,9 +293,19 @@ export class Manager {
     console.log(`${C.gray}  task${C.reset}   ${C.brightWhite}${this.task}${C.reset}`);
     console.log(`${C.gray}  cwd${C.reset}    ${C.dim}${this.cwd}${C.reset}`);
     console.log(`${C.gray}  model${C.reset}  ${C.dim}${this.model}${C.reset}`);
+    if (this.agentModel) {
+      console.log(`${C.gray}  agent${C.reset}  ${C.brightWhite}${this.agentModel}${C.reset} ${C.dim}(reasoning: ${this.reasoning})${C.reset}`);
+    }
     console.log(`${bar}\n`);
 
-    // Step 1: Spawn OpenCode as an ACP subprocess
+    // Step 1: Write opencode.json in the project cwd to set the agent model.
+    // OpenCode reads its model config from this file at startup — this is the
+    // most reliable way to control which model the ACP session uses.
+    if (this.agentModel) {
+      this.writeOpenCodeConfig(this.agentModel);
+    }
+
+    // Step 2: Spawn OpenCode as an ACP subprocess
     this.client.spawn("opencode", ["acp"]);
 
     // Step 2: Initialize the ACP connection.
@@ -308,6 +330,10 @@ export class Manager {
       mcpServers: [],
     });
     this.sessionId = sess.sessionId as string;
+    const models = sess.models as { currentModelId?: string } | undefined;
+    if (models?.currentModelId) {
+      this.log2(`${C.gray}current${C.reset}  ${C.dim}${models.currentModelId}${C.reset}`);
+    }
     this.log2(`${C.gray}session${C.reset}  ${C.dim}${this.sessionId}${C.reset}\n`);
 
     // Step 4: Expand the user's task into a detailed brief.
@@ -466,10 +492,44 @@ export class Manager {
     return this.task;
   }
 
-  /**
-   * Builds the first prompt sent to OpenCode.
-   * Wraps the expanded brief with agent instructions and ground rules.
-   */
+  private writeOpenCodeConfig(model: string): void {
+    const cfgPath = join(this.cwd, "opencode.json");
+    let cfg: Record<string, unknown> = {};
+    if (existsSync(cfgPath)) {
+      try {
+        cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
+      } catch {
+        cfg = {};
+      }
+    }
+    cfg["$schema"] = "https://opencode.ai/config.json";
+    cfg["model"] = model;
+
+    const slash = model.indexOf("/");
+    if (slash > 0) {
+      const providerId = model.slice(0, slash);
+      const modelId = model.slice(slash + 1);
+      const provider = (cfg["provider"] as Record<string, unknown>) ?? {};
+      const providerCfg = (provider[providerId] as Record<string, unknown>) ?? {};
+      const models = (providerCfg["models"] as Record<string, unknown>) ?? {};
+      const modelCfg = (models[modelId] as Record<string, unknown>) ?? {};
+      const existingOpts = (modelCfg["options"] as Record<string, unknown>) ?? {};
+      modelCfg["options"] = {
+        ...existingOpts,
+        reasoningEffort: this.reasoning,
+        textVerbosity: existingOpts["textVerbosity"] ?? "low",
+        reasoningSummary: existingOpts["reasoningSummary"] ?? "auto",
+      };
+      models[modelId] = modelCfg;
+      providerCfg["models"] = models;
+      provider[providerId] = providerCfg;
+      cfg["provider"] = provider;
+    }
+
+    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+    this.log2(`${C.gray}wrote${C.reset}    ${C.dim}${cfgPath}${C.reset} ${C.gray}(model: ${model})${C.reset}`);
+  }
+
   private initialPrompt(brief: string): string {
     return [
       brief,
@@ -518,21 +578,7 @@ export class Manager {
         },
       },
     },
-    {
-      type: "function",
-      function: {
-        name: "grep",
-        description: "Search for a pattern in files. Returns matching lines with file paths.",
-        parameters: {
-          type: "object",
-          properties: {
-            pattern: { type: "string", description: "Search pattern (regex)" },
-            path: { type: "string", description: "File or directory to search in (default: .)" },
-          },
-          required: ["pattern"],
-        },
-      },
-    },
+
     {
       type: "function",
       function: {
@@ -546,6 +592,32 @@ export class Manager {
     },
   ];
 
+  private parseXmlToolCalls(text: string): Array<{ id: string; type: "function"; function: { name: string; arguments: Record<string, string> } }> {
+    const results: Array<{ id: string; type: "function"; function: { name: string; arguments: Record<string, string> } }> = [];
+    const tcRegex = /<tool_call>\s*<function=(\w+)>([\s\S]*?)<\/function>\s*<\/tool_call>/g;
+    let match;
+    let idx = 0;
+    while ((match = tcRegex.exec(text)) !== null) {
+      const fnName = match[1];
+      const body = match[2];
+      const args: Record<string, string> = {};
+      const paramRegex = /<parameter=(\w+)>\s*([\s\S]*?)\s*<\/parameter>/g;
+      let pm;
+      while ((pm = paramRegex.exec(body)) !== null) {
+        args[pm[1]] = pm[2];
+      }
+      const knownTools = ["ls", "find", "tree"];
+      if (knownTools.includes(fnName)) {
+        results.push({
+          id: `xml_tc_${idx++}`,
+          type: "function",
+          function: { name: fnName, arguments: args },
+        });
+      }
+    }
+    return results;
+  }
+
   private execTool(name: string, args: Record<string, string>): string {
     const MAX = 10_000;
     try {
@@ -557,9 +629,7 @@ export class Manager {
         case "find":
           cmd = `find . -name ${JSON.stringify(args.pattern)} -maxdepth 5 | head -50`;
           break;
-        case "grep":
-          cmd = `grep -rn ${JSON.stringify(args.pattern)} ${JSON.stringify(args.path || ".")} | head -50`;
-          break;
+
         case "tree":
           cmd = `find ${JSON.stringify(args.path || ".")} -maxdepth 3 -print | head -80 | sort`;
           break;
@@ -591,8 +661,11 @@ export class Manager {
           `Original task: "${this.task}"`,
           `Working directory: ${this.cwd}`,
           ``,
-          `You have tools to inspect the actual filesystem — use them to verify work`,
-          `when you're unsure. You can ls, cat, find, grep, and tree the project.`,
+          `You have tools to inspect the filesystem structure — use them to verify work`,
+          `when you're unsure. Your ONLY tools are: ls, find, tree.`,
+          `You do NOT have cat, read, grep, or any file-reading/searching tool.`,
+          `You are a high-level manager — check that files and directories exist, not code details.`,
+          `Trust the coding agent's implementation. Focus on structure, not content.`,
           ``,
           `Your job is to decide whether the task is DONE or needs MORE WORK:`,
           ``,
@@ -636,18 +709,42 @@ export class Manager {
 
         messages.push(msg);
 
-        if (msg.tool_calls?.length) {
-          for (const tc of msg.tool_calls) {
-            const args = JSON.parse(tc.function.arguments || "{}");
+        const nativeCalls = msg.tool_calls ?? [];
+        const xmlCalls = (!nativeCalls.length && msg.content)
+          ? this.parseXmlToolCalls(msg.content)
+          : [];
+        const allCalls = nativeCalls.length ? nativeCalls : xmlCalls;
+
+        if (allCalls.length) {
+          const isXml = !nativeCalls.length;
+          const toolResults: string[] = [];
+          for (const tc of allCalls) {
+            const args = typeof tc.function.arguments === "string"
+              ? JSON.parse(tc.function.arguments || "{}")
+              : tc.function.arguments as Record<string, string>;
             this.log2(`${C.yellow}⚙${C.reset}  ${C.brightWhite}${tc.function.name}${C.reset}${C.gray}(${JSON.stringify(args)})${C.reset}`);
             const result = this.execTool(tc.function.name, args);
-            const preview = result.split("\n").slice(0, 6).join("\n");
-            const truncated = result.split("\n").length > 6 ? `\n${C.dim}  …(${result.split("\n").length - 6} more lines)${C.reset}` : "";
-            console.log(`${C.dim}${preview}${C.reset}${truncated}`);
+            if (this.debug) {
+              console.log(`${C.dim}${result}${C.reset}`);
+            } else {
+              const preview = result.split("\n").slice(0, 6).join("\n");
+              const truncated = result.split("\n").length > 6 ? `\n${C.dim}  …(${result.split("\n").length - 6} more lines)${C.reset}` : "";
+              console.log(`${C.dim}${preview}${C.reset}${truncated}`);
+            }
+            if (isXml) {
+              toolResults.push(`[${tc.function.name}] ${result}`);
+            } else {
+              messages.push({
+                role: "tool" as const,
+                tool_call_id: tc.id,
+                content: result,
+              });
+            }
+          }
+          if (isXml && toolResults.length) {
             messages.push({
-              role: "tool" as const,
-              tool_call_id: tc.id,
-              content: result,
+              role: "user" as const,
+              content: `Tool results:\n${toolResults.join("\n\n")}\n\nNow respond with your JSON evaluation: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
             });
           }
           continue;
@@ -655,14 +752,25 @@ export class Manager {
 
         let text = msg.content;
         if (text) {
+          const hadXmlCalls = /<tool_call>/.test(text);
+          text = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
           text = text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/, "").trim();
+
+          if (!text && hadXmlCalls) {
+            messages.push({
+              role: "user" as const,
+              content: `You tried to use tools that don't exist (like cat/grep). You only have: ls, find, tree. You don't need to read file contents — just check structure. Respond with JSON: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
+            });
+            continue;
+          }
+
           const jsonMatch = text.match(/\{[\s\S]*"done"\s*:[\s\S]*\}/);
           const jsonStr = jsonMatch ? jsonMatch[0] : text;
           try {
             return JSON.parse(jsonStr) as Evaluation;
           } catch {
             this.log2(`${C.red}✗${C.reset} JSON parse failed. Raw response:`);
-            console.log(`${C.dim}${text.slice(0, 500)}${text.length > 500 ? "…" : ""}${C.reset}`);
+            console.log(`${C.dim}${this.debug ? text : `${text.slice(0, 500)}${text.length > 500 ? "…" : ""}`}${C.reset}`);
           }
         }
         break;

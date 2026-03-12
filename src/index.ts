@@ -42,12 +42,16 @@ if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
   ${b}${w}Options${r}
     ${cy}--cwd${r} ${y}<dir>${r}        Working directory ${g}(default: .)${r}
     ${cy}--model${r} ${y}<model>${r}    Eval LLM model ${g}(default: openai/gpt-4o-mini)${r}
+    ${cy}--agent-model${r} ${y}<m>${r}  OpenCode model ${g}(e.g. openai/gpt-5.4)${r}
+    ${cy}--reasoning${r} ${y}<level>${r} Reasoning effort ${g}(low|medium|high|xhigh, default: high)${r}
     ${cy}--max-turns${r} ${y}<n>${r}    Max conversation turns ${g}(default: 50)${r}
     ${cy}--debug${r}              Log raw ACP JSON-RPC traffic ${g}(default: off)${r}
 
   ${b}${w}Environment${r}
     ${cy}OPENROUTER_API_KEY${r}  OpenRouter API key
-    ${cy}OAM_MODEL${r}           Default model ${g}(OpenRouter model ID)${r}
+    ${cy}OAM_MODEL${r}           Default eval model ${g}(OpenRouter model ID)${r}
+    ${cy}OAM_AGENT_MODEL${r}     Default OpenCode model ${g}(e.g. openai/gpt-5.4)${r}
+    ${cy}OAM_REASONING${r}       Reasoning effort level ${g}(low|medium|high|xhigh)${r}
 
   ${b}${w}Examples${r}
     ${g}$${r} oam ${y}"build a todo app with React and TypeScript"${r}
@@ -60,6 +64,8 @@ if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
 let task = "";
 let cwd = process.cwd();
 let model: string | undefined;
+let agentModel: string | undefined;
+let reasoning: string | undefined;
 let maxTurns: number | undefined;
 let debug = false;
 
@@ -70,6 +76,12 @@ for (let i = 0; i < args.length; i++) {
       break;
     case "--model":
       model = args[++i];
+      break;
+    case "--agent-model":
+      agentModel = args[++i];
+      break;
+    case "--reasoning":
+      reasoning = args[++i];
       break;
     case "--max-turns":
       maxTurns = parseInt(args[++i], 10);
@@ -91,7 +103,7 @@ if (!task) {
 // Create the manager and run the job.
 // The manager handles everything from here: spawning opencode,
 // running the prompt loop, evaluating progress, and cleaning up.
-const manager = new Manager({ task, cwd, model, maxTurns, debug });
+const manager = new Manager({ task, cwd, model, agentModel, reasoning, maxTurns, debug });
 
 manager.run().catch((err) => {
   console.error(`\x1b[31m[oam] fatal: ${err.message ?? err}\x1b[0m`);

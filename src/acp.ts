@@ -119,7 +119,7 @@ export class ACPClient extends EventEmitter {
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       const raw = JSON.stringify(msg);
-      if (this.debug) console.log(`\x1b[90m[acp:send] ${raw.slice(0, 200)}${raw.length > 200 ? "…" : ""}\x1b[0m`);
+      if (this.debug) console.log(`\x1b[90m[acp:send] ${raw}\x1b[0m`);
       this.proc!.stdin!.write(raw + "\n");
     });
   }
@@ -136,8 +136,7 @@ export class ACPClient extends EventEmitter {
    */
   private onLine(line: string): void {
     if (this.debug) {
-      const preview = line.slice(0, 200) + (line.length > 200 ? "…" : "");
-      console.log(`\x1b[90m[acp:recv] ${preview}\x1b[0m`);
+      console.log(`\x1b[90m[acp:recv] ${line}\x1b[0m`);
     }
     let msg: Record<string, unknown>;
     try {
