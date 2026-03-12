@@ -39,6 +39,16 @@ interface Evaluation {
   summary?: string;
 }
 
+/** Record of a single turn for the progress report */
+interface TurnRecord {
+  turn: number;
+  promptSnippet: string;
+  responseSnippet: string;
+  stopReason: string;
+  evalDone: boolean;
+  evalSummary?: string;
+}
+
 /** ANSI color/style helpers — purely cosmetic */
 const C = {
   reset:        "\x1b[0m",
@@ -94,6 +104,9 @@ export class Manager {
 
   /** Tracks whether we've already printed the header for the current streamed agent reply */
   private responseOpen = false;
+
+  /** History of all turns for the final progress report */
+  private history: TurnRecord[] = [];
 
   constructor(opts: ManagerOptions) {
     this.task = opts.task;
@@ -288,10 +301,17 @@ export class Manager {
     this.sessionId = sess.sessionId as string;
     this.log2(`${C.gray}session${C.reset}  ${C.dim}${this.sessionId}${C.reset}\n`);
 
-    // Step 4: The prompt loop.
-    // Start with the initial prompt (task + autonomy instructions),
-    // then keep going with follow-up prompts from the eval LLM.
-    let prompt = this.initialPrompt();
+    // Step 4: Expand the user's task into a detailed brief.
+    // The manager LLM takes the terse request and produces a thorough spec
+    // with architecture decisions, file structure, and acceptance criteria.
+    this.log2(`${C.yellow}◈${C.reset}  expanding task…`);
+    const brief = await this.expand();
+    this.logBlock("expanded brief", brief);
+
+    // Step 5: The prompt loop.
+    // Start with the expanded brief wrapped in agent instructions,
+    // then keep going with follow-up prompts from the manager LLM.
+    let prompt = this.initialPrompt(brief);
     let turn = 0;
 
     while (turn < this.maxTurns) {
@@ -331,12 +351,24 @@ export class Manager {
 
       // If the agent refused to continue, bail out
       if (stop === "refusal") {
+        this.history.push({
+          turn, promptSnippet: prompt.slice(0, 200),
+          responseSnippet: this.agentBuf.slice(0, 200),
+          stopReason: stop, evalDone: false,
+        });
         this.log2(`${C.red}✗${C.reset} agent refused — stopping`);
         break;
       }
 
-      // Step 5: Ask the eval LLM — is the task done? What should we say next?
+      // Step 6: Ask the manager LLM — is the task done? What should we say next?
       const ev = await this.evaluate();
+
+      this.history.push({
+        turn, promptSnippet: prompt.slice(0, 200),
+        responseSnippet: this.agentBuf.slice(0, 200),
+        stopReason: stop, evalDone: ev.done, evalSummary: ev.summary,
+      });
+
       if (ev.done) {
         console.log(`\n${C.bold}${C.brightGreen}✓ job complete!${C.reset}`);
         if (ev.summary) console.log(`${C.gray}  ${ev.summary}${C.reset}`);
@@ -353,27 +385,84 @@ export class Manager {
       this.log2(`${C.yellow}⚠${C.reset}  max turns ${C.bold}(${this.maxTurns})${C.reset} reached`);
     }
 
-    // Step 6: Clean up — kill the OpenCode subprocess
+    // Step 7: Print the progress report and clean up
+    this.printReport();
     this.client.destroy();
   }
 
   /**
-   * Builds the first prompt sent to OpenCode.
-   * This sets the ground rules: work autonomously, don't ask questions,
-   * make all decisions yourself, and say "TASK COMPLETE" when done.
+   * Uses the manager LLM to expand a terse user request into a detailed
+   * implementation brief — architecture, file structure, tech choices,
+   * acceptance criteria, etc. This is the "thinking" step before execution.
    */
-  private initialPrompt(): string {
+  private async expand(): Promise<string> {
+    try {
+      const res = await this.openai.chat.completions.create({
+        model: this.model,
+        messages: [
+          {
+            role: "system",
+            content: [
+              `You are a senior software architect and engineering manager.`,
+              `A developer gave you a brief task description. Your job is to expand it`,
+              `into a clear, detailed implementation brief that a coding agent can follow.`,
+              ``,
+              `Your brief should include:`,
+              `- A clear summary of what needs to be built or changed`,
+              `- Key architecture and design decisions (tech stack, patterns, structure)`,
+              `- File/directory structure if creating something new`,
+              `- Step-by-step implementation order (what to build first, second, etc.)`,
+              `- Edge cases or gotchas to watch out for`,
+              `- Acceptance criteria — how do we know it's done?`,
+              ``,
+              `Be opinionated. Make decisions. Don't hedge with "you could do X or Y" —`,
+              `pick the best option and commit to it. Be concise but thorough.`,
+              `Write in plain text, not JSON.`,
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: `Task: ${this.task}`,
+          },
+        ],
+        temperature: 0.3,
+      });
+
+      const text = res.choices[0]?.message?.content;
+      if (text) return text;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log2(`${C.red}✗${C.reset} expand error: ${C.dim}${msg}${C.reset}`);
+    }
+
+    // Fallback — just use the raw task if the expand call fails
+    return this.task;
+  }
+
+  /**
+   * Builds the first prompt sent to OpenCode.
+   * Wraps the expanded brief with agent instructions and ground rules.
+   */
+  private initialPrompt(brief: string): string {
     return [
       "You are being managed by an autonomous agent manager (OAM).",
-      "Complete the following task fully and autonomously.",
-      "Do NOT ask for clarification or confirmation — make all decisions yourself.",
-      "If unsure, pick the most reasonable option and proceed.",
+      "Your manager has analyzed the task and produced the implementation brief below.",
+      "Follow the brief closely — your manager has already made the key decisions.",
       "",
-      `TASK: ${this.task}`,
+      "Do NOT ask for clarification or confirmation — your manager will review your",
+      "work after each turn and give you further instructions if needed.",
+      "",
+      "═══════════════════════════════════",
+      "IMPLEMENTATION BRIEF",
+      "═══════════════════════════════════",
+      "",
+      brief,
+      "",
+      "═══════════════════════════════════",
       "",
       "Rules:",
-      "- Complete the entire task without stopping to ask questions",
-      "- Make all design decisions autonomously",
+      "- Follow the brief's architecture and design decisions",
+      "- Work through the implementation steps in order",
       "- Create all necessary files and directories",
       "- Install any required dependencies",
       "- Test your work when possible",
@@ -382,20 +471,19 @@ export class Manager {
   }
 
   /**
-   * Calls the eval LLM (via OpenRouter) to decide what to do next.
+   * The manager brain — reviews the agent's work after each turn and decides
+   * what to do next. This isn't a simple "done yet?" check. The manager:
    *
-   * We send it the original task + the last 2 exchanges (4 messages) from the
-   * conversation, and ask it to respond with JSON:
-   *   { "done": true/false, "summary": "...", "nextPrompt": "..." }
+   * - Reviews code quality and architectural decisions
+   * - Catches mistakes early and course-corrects
+   * - Answers questions on the user's behalf with opinionated decisions
+   * - Breaks down remaining work into clear next steps
+   * - Knows when to push for more vs. when to accept "good enough"
    *
-   * This is the "manager brain" — it decides when the task is finished,
-   * answers questions on behalf of the user, tells the agent to fix errors, etc.
-   *
-   * If the eval LLM call fails for any reason, we fall back to a generic
-   * "keep going" prompt so the job doesn't stall.
+   * If the eval LLM call fails, falls back to a generic "keep going" prompt.
    */
   private async evaluate(): Promise<Evaluation> {
-    // Only send the last 4 messages (2 exchanges) to keep context small and fast
+    // Send the last 4 messages (2 exchanges) to keep context small and fast
     const tail = this.log.slice(-4);
 
     try {
@@ -405,21 +493,28 @@ export class Manager {
           {
             role: "system",
             content: [
-              `You evaluate whether a coding agent has completed a task.`,
+              `You are a senior engineering manager overseeing a coding agent.`,
               `Original task: "${this.task}"`,
               ``,
-              `Based on the agent's latest response, determine:`,
-              `1. Is the task fully complete?`,
-              `2. If not, what should the next instruction be?`,
+              `You are reviewing the agent's latest work. Act as an intelligent manager:`,
+              ``,
+              `- REVIEW the work critically — is it correct, clean, and complete?`,
+              `- DECIDE if the task is truly done or if more work is needed`,
+              `- GUIDE the agent with specific, actionable instructions if not done`,
+              `- ANSWER any questions the agent asked — be decisive, don't defer to the user`,
+              `- CATCH mistakes early — if you see a bug, bad pattern, or missing edge case, flag it`,
+              `- PRIORITIZE — if there's remaining work, tell the agent what's most important next`,
+              ``,
+              `When writing nextPrompt, be a good manager:`,
+              `- Be specific: "Add error handling to the /api/users endpoint" not "keep going"`,
+              `- Give context: explain WHY something needs to change, not just what`,
+              `- Break it down: if there's a lot left, focus on the single most important next step`,
+              `- Be direct: don't pad with pleasantries, just give clear instructions`,
               ``,
               `Respond in JSON: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
               ``,
-              `Guidelines:`,
-              `- If the agent said "TASK COMPLETE" or equivalent → done: true`,
-              `- If the agent asked a question → answer it reasonably and tell it to proceed`,
-              `- If the agent hit an error → tell it to fix the error and continue`,
-              `- If the agent is mid-progress → tell it to continue`,
-              `- If the agent seems stuck → give specific guidance`,
+              `Set done:true ONLY when the task is genuinely complete and working.`,
+              `The agent saying "TASK COMPLETE" is a signal, but verify — did it actually finish?`,
             ].join("\n"),
           },
           // Feed it recent conversation so it knows what just happened
@@ -430,7 +525,7 @@ export class Manager {
           })),
         ],
         response_format: { type: "json_object" },
-        temperature: 0.2, // Low temperature for consistent, predictable decisions
+        temperature: 0.3,
       });
 
       const text = res.choices[0]?.message?.content;
@@ -446,6 +541,47 @@ export class Manager {
       nextPrompt:
         "Continue working on the task. If you're done, say TASK COMPLETE with a summary.",
     };
+  }
+
+  /** Prints a final progress report summarizing every turn of the job */
+  private printReport(): void {
+    if (this.history.length === 0) return;
+
+    const bar = `${C.gray}${"═".repeat(52)}${C.reset}`;
+    console.log(bar);
+    console.log(`${C.bold}${C.brightCyan}  ◈ progress report${C.reset}`);
+    console.log(bar);
+
+    for (const h of this.history) {
+      const status =
+        h.evalDone          ? `${C.brightGreen}done${C.reset}` :
+        h.stopReason === "refusal" ? `${C.red}refused${C.reset}` :
+                            `${C.yellow}continue${C.reset}`;
+
+      console.log(`\n${C.bold}${C.white}  turn ${h.turn}${C.reset}  ${status}  ${C.dim}stop: ${h.stopReason}${C.reset}`);
+
+      // Manager prompt snippet
+      const promptLine = h.promptSnippet.replace(/\n/g, " ").slice(0, 80);
+      console.log(`${C.blue}  ▸ oam${C.reset}       ${C.dim}${promptLine}${promptLine.length >= 80 ? "…" : ""}${C.reset}`);
+
+      // Agent response snippet
+      const respLine = h.responseSnippet.replace(/\n/g, " ").slice(0, 80);
+      console.log(`${C.cyan}  ◂ opencode${C.reset}  ${C.dim}${respLine || "[no response]"}${respLine.length >= 80 ? "…" : ""}${C.reset}`);
+
+      if (h.evalSummary) {
+        console.log(`${C.gray}  ╰ ${h.evalSummary}${C.reset}`);
+      }
+    }
+
+    console.log(`\n${bar}`);
+    const total = this.history.length;
+    const completed = this.history.some((h) => h.evalDone);
+    const outcome = completed
+      ? `${C.brightGreen}completed${C.reset}`
+      : `${C.yellow}incomplete${C.reset}`;
+    console.log(`${C.bold}  ${total} turn${total !== 1 ? "s" : ""}${C.reset}  ${C.gray}·${C.reset}  ${outcome}`);
+    console.log(bar);
+    console.log();
   }
 
   /** Prints a styled [oam] log line to the terminal */
