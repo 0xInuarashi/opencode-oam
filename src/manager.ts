@@ -304,9 +304,7 @@ export class Manager {
     // Step 4: Expand the user's task into a detailed brief.
     // The manager LLM takes the terse request and produces a thorough spec
     // with architecture decisions, file structure, and acceptance criteria.
-    this.log2(`${C.yellow}◈${C.reset}  expanding task…`);
     const brief = await this.expand();
-    this.logBlock("expanded brief", brief);
 
     // Step 5: The prompt loop.
     // Start with the expanded brief wrapped in agent instructions,
@@ -361,6 +359,7 @@ export class Manager {
       }
 
       // Step 6: Ask the manager LLM — is the task done? What should we say next?
+      this.log2(`${C.yellow}◈${C.reset}  evaluating…`);
       const ev = await this.evaluate();
 
       this.history.push({
@@ -393,31 +392,41 @@ export class Manager {
   /**
    * Uses the manager LLM to expand a terse user request into a detailed
    * implementation brief — architecture, file structure, tech choices,
-   * acceptance criteria, etc. This is the "thinking" step before execution.
+   * acceptance criteria, etc. Streams the output token-by-token so the
+   * user sees progress in real-time.
    */
   private async expand(): Promise<string> {
+    console.log(`\n${C.bold}${C.blue}┌── expanding task${C.reset}`);
+
     try {
-      const res = await this.openai.chat.completions.create({
+      const stream = await this.openai.chat.completions.create({
         model: this.model,
+        stream: true,
         messages: [
           {
             role: "system",
             content: [
-              `You are a senior software architect and engineering manager.`,
-              `A developer gave you a brief task description. Your job is to expand it`,
-              `into a clear, detailed implementation brief that a coding agent can follow.`,
+              `You are a human developer's stand-in — you're typing instructions into a`,
+              `coding agent (like Claude Code / Cursor / OpenCode). Write exactly what a`,
+              `skilled developer would type: direct, concise, opinionated.`,
               ``,
-              `Your brief should include:`,
-              `- A clear summary of what needs to be built or changed`,
-              `- Key architecture and design decisions (tech stack, patterns, structure)`,
-              `- File/directory structure if creating something new`,
-              `- Step-by-step implementation order (what to build first, second, etc.)`,
-              `- Edge cases or gotchas to watch out for`,
-              `- Acceptance criteria — how do we know it's done?`,
+              `Your job: take the user's brief task and turn it into a clear prompt that`,
+              `tells the agent what to build and how. Think "senior dev pairing with an`,
+              `AI" — not "architect writing a design doc."`,
               ``,
-              `Be opinionated. Make decisions. Don't hedge with "you could do X or Y" —`,
-              `pick the best option and commit to it. Be concise but thorough.`,
-              `Write in plain text, not JSON.`,
+              `Keep it short. A few paragraphs max. Include:`,
+              `- What to build (1-2 sentences)`,
+              `- Key decisions: tech stack, patterns, file structure (bullet points)`,
+              `- Implementation order if it matters (numbered list)`,
+              `- Any gotchas worth flagging (only non-obvious ones)`,
+              ``,
+              `Do NOT include:`,
+              `- Verbose explanations of obvious things`,
+              `- "You could do X or Y" hedging — just pick one`,
+              `- Acceptance criteria, testing instructions, or boilerplate checklists`,
+              `- Markdown headers or formatting — just plain text`,
+              ``,
+              `Write like you're in a Slack DM to a competent colleague, not a spec doc.`,
             ].join("\n"),
           },
           {
@@ -428,10 +437,20 @@ export class Manager {
         temperature: 0.3,
       });
 
-      const text = res.choices[0]?.message?.content;
-      if (text) return text;
+      let buf = "";
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta?.content;
+        if (delta) {
+          buf += delta;
+          process.stdout.write(`${C.dim}${delta}${C.reset}`);
+        }
+      }
+
+      console.log(`\n${C.bold}${C.blue}└──${C.reset}\n`);
+      if (buf) return buf;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      console.log(`\n${C.bold}${C.blue}└──${C.reset}`);
       this.log2(`${C.red}✗${C.reset} expand error: ${C.dim}${msg}${C.reset}`);
     }
 
@@ -445,28 +464,12 @@ export class Manager {
    */
   private initialPrompt(brief: string): string {
     return [
-      "You are being managed by an autonomous agent manager (OAM).",
-      "Your manager has analyzed the task and produced the implementation brief below.",
-      "Follow the brief closely — your manager has already made the key decisions.",
-      "",
-      "Do NOT ask for clarification or confirmation — your manager will review your",
-      "work after each turn and give you further instructions if needed.",
-      "",
-      "═══════════════════════════════════",
-      "IMPLEMENTATION BRIEF",
-      "═══════════════════════════════════",
-      "",
       brief,
       "",
-      "═══════════════════════════════════",
-      "",
-      "Rules:",
-      "- Follow the brief's architecture and design decisions",
-      "- Work through the implementation steps in order",
-      "- Create all necessary files and directories",
-      "- Install any required dependencies",
-      "- Test your work when possible",
-      '- When completely done, say "TASK COMPLETE" and provide a brief summary',
+      "---",
+      "Work fully autonomously. Don't ask questions — I'll review after each step.",
+      "Install deps, create files, test when possible.",
+      'Say "TASK COMPLETE" with a short summary when done.',
     ].join("\n");
   }
 
