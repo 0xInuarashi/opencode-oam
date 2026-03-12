@@ -519,11 +519,16 @@ export class Manager {
               `The agent saying "TASK COMPLETE" is a signal, but verify — did it actually finish?`,
             ].join("\n"),
           },
-          // Feed it recent conversation so it knows what just happened
+          // Feed it the conversation so it knows what happened
           ...tail.map((m) => ({
             role: m.role as "user" | "assistant",
             content: m.content,
           })),
+          // Anthropic requires the last message to be a user message
+          {
+            role: "user" as const,
+            content: "Review the agent's latest response above. Respond with your JSON evaluation.",
+          },
         ],
         response_format: { type: "json_object" as const },
         temperature: 0.3,
