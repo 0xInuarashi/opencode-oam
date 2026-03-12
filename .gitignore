@@ -2,3 +2,4 @@ node_modules
 .zen*
 .claude
 dist/*
+.env
