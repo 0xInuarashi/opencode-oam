@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --no-deprecation
 // Load .env from OAM's own directory (not cwd) so it works from any folder
 import { config } from "dotenv";
 import { fileURLToPath } from "url";
