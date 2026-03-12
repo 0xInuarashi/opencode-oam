@@ -22,6 +22,7 @@
  */
 
 import OpenAI from "openai";
+import { execSync } from "child_process";
 import { ACPClient } from "./acp.js";
 
 /** Options passed in from the CLI to configure a job */
@@ -484,68 +485,197 @@ export class Manager {
    *
    * If the eval LLM call fails, falls back to a generic "keep going" prompt.
    */
+  private static readonly EVAL_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+    {
+      type: "function",
+      function: {
+        name: "ls",
+        description: "List files and directories. Returns output of `ls -la` for the given path.",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string", description: "Directory path (relative to cwd)" } },
+          required: ["path"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "cat",
+        description: "Read the contents of a file.",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string", description: "File path (relative to cwd)" } },
+          required: ["path"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "find",
+        description: "Find files matching a name pattern. Returns matching paths (max 50 results).",
+        parameters: {
+          type: "object",
+          properties: { pattern: { type: "string", description: "File name pattern (e.g. '*.py', 'server.*')" } },
+          required: ["pattern"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "grep",
+        description: "Search for a pattern in files. Returns matching lines with file paths.",
+        parameters: {
+          type: "object",
+          properties: {
+            pattern: { type: "string", description: "Search pattern (regex)" },
+            path: { type: "string", description: "File or directory to search in (default: .)" },
+          },
+          required: ["pattern"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "tree",
+        description: "Show directory structure as a tree (max 3 levels deep).",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string", description: "Directory path (default: .)" } },
+        },
+      },
+    },
+  ];
+
+  private execTool(name: string, args: Record<string, string>): string {
+    const MAX = 10_000;
+    try {
+      let cmd: string;
+      switch (name) {
+        case "ls":
+          cmd = `ls -la ${JSON.stringify(args.path || ".")}`;
+          break;
+        case "cat":
+          cmd = `cat ${JSON.stringify(args.path)}`;
+          break;
+        case "find":
+          cmd = `find . -name ${JSON.stringify(args.pattern)} -maxdepth 5 | head -50`;
+          break;
+        case "grep":
+          cmd = `grep -rn ${JSON.stringify(args.pattern)} ${JSON.stringify(args.path || ".")} | head -50`;
+          break;
+        case "tree":
+          cmd = `find ${JSON.stringify(args.path || ".")} -maxdepth 3 -print | head -80 | sort`;
+          break;
+        default:
+          return `Unknown tool: ${name}`;
+      }
+      const out = execSync(cmd, {
+        cwd: this.cwd,
+        timeout: 10_000,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      return out.length > MAX ? out.slice(0, MAX) + "\n…(truncated)" : out;
+    } catch (err: unknown) {
+      const e = err as { stderr?: string; message?: string };
+      return e.stderr || e.message || "Command failed";
+    }
+  }
+
   private async evaluate(): Promise<Evaluation> {
-    // Send the full conversation log so the manager has maximum context
     const tail = this.log;
+    const maxToolRounds = 5;
+
+    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      {
+        role: "system",
+        content: [
+          `You are a senior engineering manager overseeing a coding agent.`,
+          `Original task: "${this.task}"`,
+          `Working directory: ${this.cwd}`,
+          ``,
+          `You have tools to inspect the actual filesystem — use them to verify work`,
+          `when you're unsure. You can ls, cat, find, grep, and tree the project.`,
+          ``,
+          `Your job is to decide whether the task is DONE or needs MORE WORK:`,
+          ``,
+          `- If the agent says "TASK COMPLETE" and its summary covers the original task, set done:true`,
+          `- If you're unsure whether files were created correctly, use your tools to check`,
+          `- If the agent asked a question, answer it decisively — don't defer to the user`,
+          `- If the task is clearly incomplete (missing major features, not just polish), guide the agent`,
+          `- When guiding, be specific and focus on the single most important next step`,
+          ``,
+          `Err on the side of done:true. Don't nitpick or ask for extras beyond the original task.`,
+          ``,
+          `When you've made your decision, respond in JSON: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
+        ].join("\n"),
+      },
+      ...tail.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      })),
+      {
+        role: "user" as const,
+        content: "Review the agent's latest response above. Use your tools if needed to verify, then respond with your JSON evaluation.",
+      },
+    ];
 
     try {
-      const res = await this.openai.chat.completions.create({
-        model: this.model,
-        messages: [
-          {
-            role: "system",
-            content: [
-              `You are a senior engineering manager overseeing a coding agent.`,
-              `Original task: "${this.task}"`,
-              ``,
-              `CRITICAL CONTEXT: The coding agent has FULL access to the filesystem, terminal,`,
-              `and all developer tools. It executes real commands, writes real files, and runs`,
-              `real tests. When it says it did something, it DID — trust its actions completely.`,
-              `Do NOT ask it to re-do work, re-create files, or prove that it performed actions.`,
-              ``,
-              `Your job is to decide whether the task is DONE or needs MORE WORK:`,
-              ``,
-              `- If the agent says "TASK COMPLETE" and its summary covers the original task, set done:true`,
-              `- If the agent asked a question, answer it decisively — don't defer to the user`,
-              `- If the task is clearly incomplete (missing major features, not just polish), guide the agent`,
-              `- When guiding, be specific and focus on the single most important next step`,
-              ``,
-              `Err on the side of done:true. Don't nitpick or ask for extras beyond the original task.`,
-              ``,
-              `Respond in JSON: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
-            ].join("\n"),
-          },
-          // Feed it the conversation so it knows what happened
-          ...tail.map((m) => ({
-            role: m.role as "user" | "assistant",
-            content: m.content,
-          })),
-          // Anthropic requires the last message to be a user message
-          {
-            role: "user" as const,
-            content: "Review the agent's latest response above. Respond with your JSON evaluation.",
-          },
-        ],
-        response_format: { type: "json_object" as const },
-        temperature: 0.3,
-      });
+      for (let round = 0; round < maxToolRounds; round++) {
+        const res = await this.openai.chat.completions.create({
+          model: this.model,
+          messages,
+          tools: Manager.EVAL_TOOLS,
+          temperature: 0.3,
+        });
 
-      let text = res.choices[0]?.message?.content;
-      if (text) {
-        // Strip markdown code fences if the model wraps JSON in ```json ... ```
-        text = text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/, "").trim();
-        try {
-          return JSON.parse(text) as Evaluation;
-        } catch {
-          this.log2(`${C.red}✗${C.reset} JSON parse failed. Raw response:`);
-          console.log(`${C.dim}${text.slice(0, 500)}${text.length > 500 ? "…" : ""}${C.reset}`);
+        const choice = res.choices[0];
+        const msg = choice?.message;
+        if (!msg) break;
+
+        if (msg.content) {
+          console.log(`${C.dim}${C.magenta}${msg.content}${C.reset}`);
         }
+
+        messages.push(msg);
+
+        if (msg.tool_calls?.length) {
+          for (const tc of msg.tool_calls) {
+            const args = JSON.parse(tc.function.arguments || "{}");
+            this.log2(`${C.yellow}⚙${C.reset}  ${C.brightWhite}${tc.function.name}${C.reset}${C.gray}(${JSON.stringify(args)})${C.reset}`);
+            const result = this.execTool(tc.function.name, args);
+            const preview = result.split("\n").slice(0, 6).join("\n");
+            const truncated = result.split("\n").length > 6 ? `\n${C.dim}  …(${result.split("\n").length - 6} more lines)${C.reset}` : "";
+            console.log(`${C.dim}${preview}${C.reset}${truncated}`);
+            messages.push({
+              role: "tool" as const,
+              tool_call_id: tc.id,
+              content: result,
+            });
+          }
+          continue;
+        }
+
+        let text = msg.content;
+        if (text) {
+          text = text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/, "").trim();
+          try {
+            return JSON.parse(text) as Evaluation;
+          } catch {
+            this.log2(`${C.red}✗${C.reset} JSON parse failed. Raw response:`);
+            console.log(`${C.dim}${text.slice(0, 500)}${text.length > 500 ? "…" : ""}${C.reset}`);
+          }
+        }
+        break;
       }
     } catch (err: unknown) {
       this.logError("evaluate() failed", err);
     }
 
-    // Fallback if the eval LLM fails — don't stall, just tell the agent to continue
     return {
       done: false,
       nextPrompt:
