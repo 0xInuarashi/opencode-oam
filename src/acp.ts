@@ -41,6 +41,8 @@ interface PendingRequest {
 export class ACPClient extends EventEmitter {
   private proc: ChildProcess | null = null;
 
+  debug = false;
+
   /** Auto-incrementing counter for JSON-RPC request IDs */
   private nextId = 0;
 
@@ -115,10 +117,10 @@ export class ACPClient extends EventEmitter {
     const msg = { jsonrpc: "2.0", id, method, params };
 
     return new Promise((resolve, reject) => {
-      // Store the promise handlers so we can settle them when the response arrives
       this.pending.set(id, { resolve, reject });
-      // Write the JSON message as a single line to the child's stdin
-      this.proc!.stdin!.write(JSON.stringify(msg) + "\n");
+      const raw = JSON.stringify(msg);
+      if (this.debug) console.log(`\x1b[90m[acp:send] ${raw.slice(0, 200)}${raw.length > 200 ? "…" : ""}\x1b[0m`);
+      this.proc!.stdin!.write(raw + "\n");
     });
   }
 
@@ -133,11 +135,14 @@ export class ACPClient extends EventEmitter {
    * Parses the JSON and routes it to the right handler based on message type.
    */
   private onLine(line: string): void {
+    if (this.debug) {
+      const preview = line.slice(0, 200) + (line.length > 200 ? "…" : "");
+      console.log(`\x1b[90m[acp:recv] ${preview}\x1b[0m`);
+    }
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(line);
     } catch {
-      // Not valid JSON — skip (could be debug output that leaked to stdout)
       return;
     }
 

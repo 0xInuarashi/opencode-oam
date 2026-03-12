@@ -31,6 +31,7 @@ export interface ManagerOptions {
   cwd: string;
   model?: string;
   maxTurns?: number;
+  debug?: boolean;
 }
 
 /** The result of the eval LLM deciding whether the job is done */
@@ -127,6 +128,7 @@ export class Manager {
     });
 
     this.client = new ACPClient();
+    this.client.debug = opts.debug ?? false;
     this.wire();
   }
 
@@ -177,6 +179,12 @@ export class Manager {
         if (_method === "session/update") this.onUpdate(params);
       }
     );
+
+    this.client.on("stderr", (data: string) => {
+      for (const line of data.split("\n").filter(Boolean)) {
+        console.log(`${C.red}[opencode:stderr]${C.reset} ${C.dim}${line}${C.reset}`);
+      }
+    });
 
     // Log when the OpenCode process exits
     this.client.on("exit", (code: number | null) => {

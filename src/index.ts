@@ -43,6 +43,7 @@ if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     ${cy}--cwd${r} ${y}<dir>${r}        Working directory ${g}(default: .)${r}
     ${cy}--model${r} ${y}<model>${r}    Eval LLM model ${g}(default: openai/gpt-4o-mini)${r}
     ${cy}--max-turns${r} ${y}<n>${r}    Max conversation turns ${g}(default: 50)${r}
+    ${cy}--debug${r}              Log raw ACP JSON-RPC traffic ${g}(default: off)${r}
 
   ${b}${w}Environment${r}
     ${cy}OPENROUTER_API_KEY${r}  OpenRouter API key
@@ -60,23 +61,23 @@ let task = "";
 let cwd = process.cwd();
 let model: string | undefined;
 let maxTurns: number | undefined;
+let debug = false;
 
 for (let i = 0; i < args.length; i++) {
   switch (args[i]) {
     case "--cwd":
-      // Resolve to absolute path so OpenCode gets a valid working directory
       cwd = resolve(args[++i]);
       break;
     case "--model":
-      // Override the eval LLM model (OpenRouter format, e.g. "anthropic/claude-sonnet-4")
       model = args[++i];
       break;
     case "--max-turns":
-      // Safety limit for how many back-and-forth turns before giving up
       maxTurns = parseInt(args[++i], 10);
       break;
+    case "--debug":
+      debug = true;
+      break;
     default:
-      // Any non-flag argument is treated as the task description
       if (!args[i].startsWith("--")) task = args[i];
   }
 }
@@ -90,7 +91,7 @@ if (!task) {
 // Create the manager and run the job.
 // The manager handles everything from here: spawning opencode,
 // running the prompt loop, evaluating progress, and cleaning up.
-const manager = new Manager({ task, cwd, model, maxTurns });
+const manager = new Manager({ task, cwd, model, maxTurns, debug });
 
 manager.run().catch((err) => {
   console.error(`\x1b[31m[oam] fatal: ${err.message ?? err}\x1b[0m`);
