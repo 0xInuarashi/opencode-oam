@@ -6,9 +6,9 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
-import { readdirSync, statSync, mkdirSync, rmSync, existsSync } from "fs";
+import { readdirSync, statSync, mkdirSync, rmSync, existsSync, statfsSync } from "fs";
 import { join, resolve, dirname } from "path";
-import { homedir } from "os";
+import { homedir, totalmem, freemem, cpus, loadavg, hostname, uptime } from "os";
 import { Manager, type ManagerOptions } from "./manager.js";
 
 const PORT = parseInt(process.env.OAM_PORT || "3399", 10);
@@ -25,6 +25,80 @@ interface ActiveJob {
 
 const jobs = new Map<string, ActiveJob>();
 let jobCounter = 0;
+
+interface CpuSnapshot {
+  idle: number;
+  total: number;
+}
+
+function readCpuSnapshot(): CpuSnapshot {
+  return cpus().reduce((acc, cpu) => {
+    const total = Object.values(cpu.times).reduce((sum, time) => sum + time, 0);
+    return {
+      idle: acc.idle + cpu.times.idle,
+      total: acc.total + total,
+    };
+  }, { idle: 0, total: 0 });
+}
+
+let previousCpuSnapshot = readCpuSnapshot();
+let previousCpuUsage = 0;
+
+function readCpuUsagePercent(): number {
+  const next = readCpuSnapshot();
+  const idleDelta = next.idle - previousCpuSnapshot.idle;
+  const totalDelta = next.total - previousCpuSnapshot.total;
+  previousCpuSnapshot = next;
+
+  if (totalDelta <= 0) return previousCpuUsage;
+
+  const usage = Math.max(0, Math.min(100, (1 - idleDelta / totalDelta) * 100));
+  previousCpuUsage = usage;
+  return usage;
+}
+
+function readDiskUsage() {
+  try {
+    const stats = statfsSync("/");
+    const total = stats.blocks * stats.bsize;
+    const free = stats.bavail * stats.bsize;
+    const used = total - free;
+    return {
+      path: "/",
+      total,
+      used,
+      free,
+      pct: total > 0 ? (used / total) * 100 : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readSystemInfo() {
+  const memoryTotal = totalmem();
+  const memoryFree = freemem();
+  const memoryUsed = memoryTotal - memoryFree;
+  const disk = readDiskUsage();
+
+  return {
+    host: hostname(),
+    updatedAt: Date.now(),
+    uptimeSec: uptime(),
+    cpu: {
+      pct: readCpuUsagePercent(),
+      loadAvg: loadavg(),
+      cores: cpus().length,
+    },
+    memory: {
+      total: memoryTotal,
+      used: memoryUsed,
+      free: memoryFree,
+      pct: memoryTotal > 0 ? (memoryUsed / memoryTotal) * 100 : 0,
+    },
+    disk,
+  };
+}
 
 function sendSSE(res: ServerResponse, data: Record<string, unknown>): void {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -219,6 +293,12 @@ async function handleAPI(req: IncomingMessage, res: ServerResponse): Promise<voi
     return;
   }
 
+  // GET /api/system — current machine resource usage
+  if (path === "/api/system" && req.method === "GET") {
+    json(res, 200, readSystemInfo());
+    return;
+  }
+
   // POST /api/fs/mkdir — create a directory
   if (path === "/api/fs/mkdir" && req.method === "POST") {
     const body = JSON.parse(await parseBody(req));
@@ -290,10 +370,27 @@ const HTML = `<!DOCTYPE html>
   .header {
     border-bottom: 1px solid var(--border);
     padding: 16px 24px;
-    display: flex; align-items: center; gap: 12px;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    background:
+      radial-gradient(circle at top left, rgba(88,166,255,0.12), transparent 32%),
+      radial-gradient(circle at top right, rgba(63,185,80,0.08), transparent 28%),
+      var(--bg);
   }
+  .header-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
   .header h1 { font-size: 16px; color: var(--cyan); font-weight: 600; }
   .header span { color: var(--text-dim); font-size: 13px; }
+  .system-bar {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--text-dim); font-size: 12px;
+  }
+  .system-bar .sep { margin: 0 2px; opacity: 0.35; }
+  .sys-metric { display: inline-flex; align-items: center; gap: 5px; }
+  .sys-metric-label { text-transform: uppercase; font-size: 10px; letter-spacing: 0.06em; opacity: 0.7; }
+  .sys-metric-val { color: var(--text-bright); font-weight: 600; font-size: 12px; min-width: 32px; }
+  .sys-bar { width: 36px; height: 4px; border-radius: 999px; background: rgba(255,255,255,0.08); overflow: hidden; display: inline-block; vertical-align: middle; }
+  .sys-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), #7ee787); transition: width 0.35s ease; }
+  .sys-bar-fill.warn { background: linear-gradient(90deg, var(--yellow), #ffa657); }
+  .sys-bar-fill.hot { background: linear-gradient(90deg, #ff7b72, var(--red)); }
   .container { max-width: 960px; margin: 0 auto; padding: 24px; }
 
   /* New job form */
@@ -503,12 +600,26 @@ const HTML = `<!DOCTYPE html>
   }
   .new-folder-row.open { display: flex; }
   .new-folder-row input { flex: 1; font-size: 12px; padding: 5px 10px; }
+
+  @media (max-width: 880px) {
+    .header { align-items: flex-start; flex-direction: column; }
+    .system-bar { width: 100%; flex-wrap: wrap; }
+  }
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>◈ oam</h1>
-  <span>OpenCode Agent Manager</span>
+  <div class="header-brand">
+    <h1>◈ oam</h1>
+    <span>OpenCode Agent Manager</span>
+  </div>
+  <div class="system-bar">
+    <span class="sys-metric"><span class="sys-metric-label">CPU</span><span class="sys-metric-val" id="sys-cpu">--</span><span class="sys-bar"><span class="sys-bar-fill" id="sys-cpu-fill"></span></span></span>
+    <span class="sep">·</span>
+    <span class="sys-metric"><span class="sys-metric-label">MEM</span><span class="sys-metric-val" id="sys-memory">--</span><span class="sys-bar"><span class="sys-bar-fill" id="sys-memory-fill"></span></span></span>
+    <span class="sep">·</span>
+    <span class="sys-metric"><span class="sys-metric-label">DISK</span><span class="sys-metric-val" id="sys-disk">--</span><span class="sys-bar"><span class="sys-bar-fill" id="sys-disk-fill"></span></span></span>
+  </div>
 </div>
 <div class="container">
   <div class="form-card">
@@ -571,6 +682,7 @@ const emptyEl = document.getElementById('empty-msg');
 const taskEl = document.getElementById('task');
 const activeStreams = {};
 let activeJobId = null;
+let systemPollTimer = null;
 
 taskEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); startJob(); }
@@ -764,6 +876,72 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx++;
+  }
+  return value.toFixed(value >= 10 || idx === 0 ? 0 : 1) + ' ' + units[idx];
+}
+
+function formatPct(value) {
+  if (!Number.isFinite(value)) return '--';
+  return Math.round(value) + '%';
+}
+
+function formatUptime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '--';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    return days + 'd ' + (hours % 24) + 'h';
+  }
+  if (hours > 0) return hours + 'h ' + minutes + 'm';
+  return minutes + 'm';
+}
+
+function setUsageFill(id, pct) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
+  el.classList.remove('warn', 'hot');
+  if (pct >= 90) el.classList.add('hot');
+  else if (pct >= 75) el.classList.add('warn');
+}
+
+function renderSystemStats(data) {
+  document.getElementById('sys-cpu').textContent = formatPct(data.cpu?.pct);
+  setUsageFill('sys-cpu-fill', data.cpu?.pct || 0);
+  document.getElementById('sys-memory').textContent = formatPct(data.memory?.pct);
+  setUsageFill('sys-memory-fill', data.memory?.pct || 0);
+  document.getElementById('sys-disk').textContent = data.disk ? formatPct(data.disk.pct) : '--';
+  setUsageFill('sys-disk-fill', data.disk?.pct || 0);
+}
+
+async function refreshSystemStats() {
+  try {
+    const res = await fetch('/api/system');
+    if (!res.ok) throw new Error('bad response');
+    const data = await res.json();
+    renderSystemStats(data);
+  } catch {
+    document.getElementById('sys-cpu').textContent = '--';
+    document.getElementById('sys-memory').textContent = '--';
+    document.getElementById('sys-disk').textContent = '--';
+  }
+}
+
+function startSystemPolling() {
+  refreshSystemStats();
+  if (systemPollTimer) clearInterval(systemPollTimer);
+  systemPollTimer = setInterval(refreshSystemStats, 3000);
+}
+
 // Load existing jobs on page load
 fetch('/api/jobs').then(r => r.json()).then(list => {
   if (list.length) emptyEl.style.display = 'none';
@@ -771,6 +949,8 @@ fetch('/api/jobs').then(r => r.json()).then(list => {
     addJobCard(j.id, j.task, j.status);
   }
 }).catch(() => {});
+
+startSystemPolling();
 
 // ── File Browser ──
 let fbCurrentPath = '';
@@ -961,7 +1141,6 @@ const server = createServer(async (req, res) => {
 
 export function startServer(): void {
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`\n\x1b[1m\x1b[96m  ◈ oam web\x1b[0m  \x1b[90m·\x1b[0m  http://0.0.0.0:${PORT}`);
-    console.log(`\x1b[90m  Open in your browser to trigger and watch jobs\x1b[0m\n`);
+    console.log(`\x1b[1m\x1b[96m◈ oam web\x1b[0m \x1b[90m·\x1b[0m http://0.0.0.0:${PORT}`);
   });
 }
