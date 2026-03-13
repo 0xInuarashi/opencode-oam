@@ -29,8 +29,21 @@ import { Manager } from "./manager.js";
 // Grab everything after `node index.js` (or `oam`)
 const args = process.argv.slice(2);
 
-// Web UI mode — start the server and stop here
-if (args.includes("--serve")) {
+// Daemon management commands
+if (args.includes("--daemon") || args.includes("-d")) {
+  const { daemonStart } = await import("./daemon.js");
+  daemonStart(fileURLToPath(import.meta.url));
+} else if (args.includes("--stop")) {
+  const { daemonStop } = await import("./daemon.js");
+  daemonStop();
+} else if (args.includes("--status")) {
+  const { daemonStatus } = await import("./daemon.js");
+  daemonStatus();
+} else if (args.includes("--logs")) {
+  const { daemonLogs } = await import("./daemon.js");
+  daemonLogs(args.includes("-f") || args.includes("--follow"));
+} else if (args.includes("--serve")) {
+  // Web UI mode (foreground) — also used internally by --daemon
   const { startServer } = await import("./server.js");
   startServer();
 } else if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
@@ -49,7 +62,11 @@ if (args.includes("--serve")) {
     ${cy}--agent-model${r} ${y}<m>${r}  OpenCode model ${g}(e.g. openai/gpt-5.4)${r}
     ${cy}--reasoning${r} ${y}<level>${r} Reasoning effort ${g}(low|medium|high|xhigh, default: high)${r}
     ${cy}--max-turns${r} ${y}<n>${r}    Max conversation turns ${g}(default: 50)${r}
-    ${cy}--serve${r}              Start web UI ${g}(default: port 3399, 0.0.0.0)${r}
+    ${cy}--serve${r}              Start web UI in foreground ${g}(port 3399, 0.0.0.0)${r}
+    ${cy}--daemon${r} ${g}|${r} ${cy}-d${r}        Start web UI as background daemon
+    ${cy}--stop${r}               Stop the background daemon
+    ${cy}--status${r}             Check if daemon is running
+    ${cy}--logs${r} ${g}[-f]${r}          Show daemon logs ${g}(-f to follow)${r}
     ${cy}--debug${r}              Log raw ACP JSON-RPC traffic ${g}(default: off)${r}
 
   ${b}${w}Environment${r}
@@ -62,7 +79,9 @@ if (args.includes("--serve")) {
   ${b}${w}Examples${r}
     ${g}$${r} oam ${y}"build a todo app with React and TypeScript"${r}
     ${g}$${r} oam ${y}"fix the bug in src/auth.ts"${r} --cwd ./my-project
-    ${g}$${r} oam ${y}--serve${r}
+    ${g}$${r} oam ${y}--daemon${r}                          ${g}# start persistent server${r}
+    ${g}$${r} oam ${y}--stop${r}                            ${g}# stop the server${r}
+    ${g}$${r} oam ${y}--logs -f${r}                         ${g}# tail daemon logs${r}
 `);
   process.exit(0);
 } else {
