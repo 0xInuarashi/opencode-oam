@@ -651,7 +651,7 @@ export class Manager {
 
   private async evaluate(): Promise<Evaluation> {
     const tail = this.log;
-    const maxToolRounds = 5;
+    const maxToolRounds = 20;
 
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       {
@@ -667,17 +667,21 @@ export class Manager {
           `You are a high-level manager — check that files and directories exist, not code details.`,
           `Trust the coding agent's implementation. Focus on structure, not content.`,
           ``,
+          `IMPORTANT: Make your decision quickly. One or two tool calls max to spot-check`,
+          `structure, then immediately output your JSON verdict. Do NOT exhaustively explore`,
+          `every directory — a single tree or ls at the root is usually enough.`,
+          ``,
           `Your job is to decide whether the task is DONE or needs MORE WORK:`,
           ``,
           `- If the agent says "TASK COMPLETE" and its summary covers the original task, set done:true`,
-          `- If you're unsure whether files were created correctly, use your tools to check`,
+          `- If you're unsure whether files were created correctly, one quick ls/tree is enough`,
           `- If the agent asked a question, answer it decisively — don't defer to the user`,
           `- If the task is clearly incomplete (missing major features, not just polish), guide the agent`,
           `- When guiding, be specific and focus on the single most important next step`,
           ``,
           `Err on the side of done:true. Don't nitpick or ask for extras beyond the original task.`,
           ``,
-          `When you've made your decision, respond in JSON: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
+          `ALWAYS end with JSON on its own: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
         ].join("\n"),
       },
       ...tail.map((m) => ({
@@ -691,6 +695,7 @@ export class Manager {
     ];
 
     try {
+      let exhausted = true;
       for (let round = 0; round < maxToolRounds; round++) {
         const res = await this.openai.chat.completions.create({
           model: this.model,
@@ -701,7 +706,7 @@ export class Manager {
 
         const choice = res.choices[0];
         const msg = choice?.message;
-        if (!msg) break;
+        if (!msg) { exhausted = false; break; }
 
         if (msg.content) {
           console.log(`${C.dim}${C.magenta}${msg.content}${C.reset}`);
@@ -750,6 +755,7 @@ export class Manager {
           continue;
         }
 
+        exhausted = false;
         let text = msg.content;
         if (text) {
           const hadXmlCalls = /<tool_call>/.test(text);
@@ -761,6 +767,7 @@ export class Manager {
               role: "user" as const,
               content: `You tried to use tools that don't exist (like cat/grep). You only have: ls, find, tree. You don't need to read file contents — just check structure. Respond with JSON: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
             });
+            exhausted = true;
             continue;
           }
 
@@ -771,9 +778,39 @@ export class Manager {
           } catch {
             this.log2(`${C.red}✗${C.reset} JSON parse failed. Raw response:`);
             console.log(`${C.dim}${this.debug ? text : `${text.slice(0, 500)}${text.length > 500 ? "…" : ""}`}${C.reset}`);
+            exhausted = true;
           }
         }
         break;
+      }
+
+      if (exhausted) {
+        this.log2(`${C.yellow}⚠${C.reset}  eval used all tool rounds — forcing final decision`);
+        messages.push({
+          role: "user" as const,
+          content: `Stop using tools. Based on everything you've already seen, make your decision NOW. Respond ONLY with JSON: {"done": bool, "summary": "...", "nextPrompt": "..."}`,
+        });
+
+        const finalRes = await this.openai.chat.completions.create({
+          model: this.model,
+          messages,
+          temperature: 0.3,
+        });
+        const finalText = finalRes.choices[0]?.message?.content;
+        if (finalText) {
+          console.log(`${C.dim}${C.magenta}${finalText}${C.reset}`);
+          const cleaned = finalText
+            .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+            .replace(/^```(?:json)?\s*\n?/i, "")
+            .replace(/\n?```\s*$/, "")
+            .trim();
+          const jsonMatch = cleaned.match(/\{[\s\S]*"done"\s*:[\s\S]*\}/);
+          if (jsonMatch) {
+            try {
+              return JSON.parse(jsonMatch[0]) as Evaluation;
+            } catch { /* fall through */ }
+          }
+        }
       }
     } catch (err: unknown) {
       this.logError("evaluate() failed", err);
