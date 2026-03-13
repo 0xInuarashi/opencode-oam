@@ -25,6 +25,7 @@ import OpenAI from "openai";
 import { execSync } from "child_process";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
+import { EventEmitter } from "events";
 import { ACPClient } from "./acp.js";
 
 /** Options passed in from the CLI to configure a job */
@@ -73,7 +74,7 @@ const C = {
   brightWhite:  "\x1b[97m",
 } as const;
 
-export class Manager {
+export class Manager extends EventEmitter {
   /** ACP transport — handles JSON-RPC communication with the OpenCode subprocess */
   private client: ACPClient;
 
@@ -120,6 +121,7 @@ export class Manager {
   private reasoning: string;
 
   constructor(opts: ManagerOptions) {
+    super();
     this.task = opts.task;
     this.cwd = opts.cwd;
     this.model = opts.model || process.env.OAM_MODEL || "openai/gpt-4o-mini";
@@ -175,6 +177,7 @@ export class Manager {
       console.log(
         `${C.green}✓${C.reset} ${C.gray}approved:${C.reset} ${C.brightWhite}${toolCall?.title ?? "permission"}${C.reset} ${C.gray}→${C.reset} ${C.dim}${pick?.name ?? "allow"}${C.reset}`
       );
+      this.webEvent("approved", { title: toolCall?.title ?? "permission", option: pick?.name ?? "allow" });
 
       // Respond to OpenCode with the selected permission option
       return {
@@ -228,6 +231,7 @@ export class Manager {
           }
           this.agentBuf += c.text;
           process.stdout.write(c.text);
+          this.webEvent("agent_chunk", { text: c.text });
         }
         break;
       }
@@ -236,6 +240,7 @@ export class Manager {
         const c = u.content as { type?: string; text?: string } | undefined;
         if (c?.type === "text" && c.text) {
           process.stdout.write(`${C.dim}${C.magenta}${c.text}${C.reset}`);
+          this.webEvent("thought_chunk", { text: c.text });
         }
         break;
       }
@@ -245,6 +250,7 @@ export class Manager {
         const status = u.status as string;
         const statusColor = status === "running" ? C.yellow : C.gray;
         console.log(`${C.yellow}⚙${C.reset}  ${C.brightWhite}${title}${C.reset} ${statusColor}${C.dim}[${status}]${C.reset}`);
+        this.webEvent("tool_call", { title, status });
         break;
       }
       case "tool_call_update": {
@@ -253,8 +259,10 @@ export class Manager {
         const id = u.toolCallId as string;
         if (status === "completed") {
           console.log(`${C.green}✓${C.reset}  ${C.dim}${id}${C.reset}`);
+          this.webEvent("tool_done", { id, status: "completed" });
         } else if (status === "failed") {
           console.log(`${C.red}✗${C.reset}  ${C.dim}${id}${C.reset}`);
+          this.webEvent("tool_done", { id, status: "failed" });
         }
         break;
       }
@@ -266,6 +274,7 @@ export class Manager {
         }>;
         if (entries?.length) {
           console.log(`\n${C.bold}${C.blue}◈ plan${C.reset}`);
+          this.webEvent("plan", { entries: entries.map(e => ({ content: e.content, status: e.status })) });
           for (const e of entries) {
             const sym =
               e.status === "completed" ? `${C.green}✓${C.reset}` :
@@ -352,6 +361,7 @@ export class Manager {
       const pct = Math.round((turn / this.maxTurns) * 20);
       const bar2 = `${C.cyan}${"█".repeat(pct)}${C.dim}${"░".repeat(20 - pct)}${C.reset}`;
       console.log(`\n${C.bold}${C.gray}── turn ${turn}/${this.maxTurns}${C.reset}  ${bar2}\n`);
+      this.webEvent("turn", { turn, maxTurns: this.maxTurns });
 
       // Reset the agent message buffer for this turn
       this.agentBuf = "";
@@ -395,6 +405,7 @@ export class Manager {
 
       // Step 6: Ask the manager LLM — is the task done? What should we say next?
       this.log2(`${C.yellow}◈${C.reset}  evaluating…`);
+      this.webEvent("status", { phase: "evaluating" });
       const ev = await this.evaluate();
 
       this.history.push({
@@ -407,6 +418,7 @@ export class Manager {
         console.log(`\n${C.bold}${C.brightGreen}✓ job complete!${C.reset}`);
         if (ev.summary) console.log(`${C.gray}  ${ev.summary}${C.reset}`);
         console.log();
+        this.webEvent("done", { summary: ev.summary ?? "", turns: turn });
         break;
       }
 
@@ -417,6 +429,7 @@ export class Manager {
 
     if (turn >= this.maxTurns) {
       this.log2(`${C.yellow}⚠${C.reset}  max turns ${C.bold}(${this.maxTurns})${C.reset} reached`);
+      this.webEvent("done", { summary: "Max turns reached", turns: turn });
     }
 
     // Step 7: Print the progress report and clean up
@@ -432,6 +445,7 @@ export class Manager {
    */
   private async expand(): Promise<string> {
     console.log(`\n${C.bold}${C.blue}┌── expanding task${C.reset}`);
+    this.webEvent("status", { phase: "expanding" });
 
     try {
       const stream = await this.openai.chat.completions.create({
@@ -478,6 +492,7 @@ export class Manager {
         if (delta) {
           buf += delta;
           process.stdout.write(`${C.dim}${delta}${C.reset}`);
+          this.webEvent("expand_chunk", { text: delta });
         }
       }
 
@@ -864,9 +879,20 @@ export class Manager {
     console.log();
   }
 
+  /** Strips ANSI escape codes from a string */
+  private static stripAnsi(s: string): string {
+    return s.replace(/\x1b\[[0-9;]*m/g, "");
+  }
+
+  /** Emits a structured web event for SSE consumers */
+  private webEvent(type: string, data: Record<string, unknown> = {}): void {
+    this.emit("web", { type, ...data });
+  }
+
   /** Prints a styled [oam] log line to the terminal */
   private log2(msg: string): void {
     console.log(`${C.bold}${C.brightCyan}[oam]${C.reset} ${msg}`);
+    this.webEvent("log", { text: Manager.stripAnsi(msg) });
   }
 
   /** Verbose error logger — dumps everything useful for debugging API failures */
