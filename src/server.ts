@@ -6,6 +6,9 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
+import { readdirSync, statSync, mkdirSync, rmSync, existsSync } from "fs";
+import { join, resolve, dirname } from "path";
+import { homedir } from "os";
 import { Manager, type ManagerOptions } from "./manager.js";
 
 const PORT = parseInt(process.env.OAM_PORT || "3399", 10);
@@ -131,6 +134,24 @@ async function handleAPI(req: IncomingMessage, res: ServerResponse): Promise<voi
     return;
   }
 
+  // POST /api/jobs/:id/stop — stop a running job
+  const stopMatch = path.match(/^\/api\/jobs\/([^/]+)\/stop$/);
+  if (stopMatch && req.method === "POST") {
+    const job = jobs.get(stopMatch[1]);
+    if (!job) {
+      json(res, 404, { error: "job not found" });
+      return;
+    }
+    if (job.status !== "running") {
+      json(res, 400, { error: "job is not running" });
+      return;
+    }
+    job.manager.stop();
+    job.status = "done";
+    json(res, 200, { id: job.id, stopped: true });
+    return;
+  }
+
   // GET /api/jobs/:id/stream — SSE stream for a job
   const streamMatch = path.match(/^\/api\/jobs\/([^/]+)\/stream$/);
   if (streamMatch && req.method === "GET") {
@@ -157,6 +178,90 @@ async function handleAPI(req: IncomingMessage, res: ServerResponse): Promise<voi
     req.on("close", () => {
       job.clients.delete(res);
     });
+    return;
+  }
+
+  // GET /api/fs/list?path=... — list directory contents
+  if (path === "/api/fs/list" && req.method === "GET") {
+    const dirPath = resolve(url.searchParams.get("path") || homedir());
+    try {
+      const entries = readdirSync(dirPath, { withFileTypes: true });
+      const items = entries
+        .filter((e) => {
+          try { return !e.name.startsWith("."); } catch { return false; }
+        })
+        .map((e) => {
+          const fullPath = join(dirPath, e.name);
+          let size = 0;
+          let mtime = 0;
+          try {
+            const st = statSync(fullPath);
+            size = st.size;
+            mtime = st.mtimeMs;
+          } catch { /* permission denied etc */ }
+          return {
+            name: e.name,
+            path: fullPath,
+            isDir: e.isDirectory(),
+            size,
+            mtime,
+          };
+        })
+        .sort((a, b) => {
+          if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
+      json(res, 200, { path: dirPath, parent: dirname(dirPath), items });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      json(res, 400, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/fs/mkdir — create a directory
+  if (path === "/api/fs/mkdir" && req.method === "POST") {
+    const body = JSON.parse(await parseBody(req));
+    const dirPath = resolve(body.path as string);
+    if (!dirPath) {
+      json(res, 400, { error: "path is required" });
+      return;
+    }
+    try {
+      mkdirSync(dirPath, { recursive: true });
+      json(res, 201, { path: dirPath, created: true });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      json(res, 400, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/fs/delete — delete a file or directory
+  if (path === "/api/fs/delete" && req.method === "POST") {
+    const body = JSON.parse(await parseBody(req));
+    const targetPath = resolve(body.path as string);
+    if (!targetPath || targetPath === "/") {
+      json(res, 400, { error: "invalid path" });
+      return;
+    }
+    try {
+      if (!existsSync(targetPath)) {
+        json(res, 404, { error: "path does not exist" });
+        return;
+      }
+      rmSync(targetPath, { recursive: true });
+      json(res, 200, { path: targetPath, deleted: true });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      json(res, 400, { error: message });
+    }
+    return;
+  }
+
+  // GET /api/fs/home — get the home directory
+  if (path === "/api/fs/home" && req.method === "GET") {
+    json(res, 200, { home: homedir(), cwd: process.cwd() });
     return;
   }
 
@@ -285,6 +390,119 @@ const HTML = `<!DOCTYPE html>
 
   .empty { text-align: center; color: var(--text-dim); padding: 48px;
     font-size: 13px; }
+
+  .btn-stop {
+    background: transparent; color: var(--red); border: 1px solid var(--red);
+    padding: 3px 10px; border-radius: 6px; font-family: inherit;
+    font-size: 11px; font-weight: 600; cursor: pointer; opacity: 0.8;
+    transition: all 0.2s; flex-shrink: 0;
+  }
+  .btn-stop:hover { opacity: 1; background: rgba(248,81,73,0.1); }
+  .btn-stop.hidden { display: none; }
+
+  /* File browser modal */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6); z-index: 100;
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; width: 640px; max-width: 95vw;
+    max-height: 80vh; display: flex; flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .modal-head {
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .modal-head h3 { font-size: 14px; color: var(--text-bright); }
+  .modal-close {
+    background: none; border: none; color: var(--text-dim);
+    font-size: 18px; cursor: pointer; padding: 4px 8px;
+  }
+  .modal-close:hover { color: var(--text-bright); }
+
+  /* Breadcrumbs */
+  .breadcrumbs {
+    padding: 10px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+    font-size: 12px;
+  }
+  .bc-seg {
+    color: var(--cyan); cursor: pointer; padding: 2px 4px;
+    border-radius: 3px; background: none; border: none;
+    font-family: inherit; font-size: 12px;
+  }
+  .bc-seg:hover { background: rgba(88,166,255,0.1); }
+  .bc-sep { color: var(--text-dim); }
+
+  /* File list */
+  .file-list {
+    flex: 1; overflow-y: auto; padding: 8px 0;
+    min-height: 200px; max-height: 50vh;
+  }
+  .file-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 20px; cursor: pointer; font-size: 13px;
+    transition: background 0.15s;
+  }
+  .file-item:hover { background: rgba(88,166,255,0.06); }
+  .file-item.selected { background: rgba(88,166,255,0.12); }
+  .file-icon { width: 20px; text-align: center; flex-shrink: 0; }
+  .file-icon.dir { color: var(--cyan); }
+  .file-icon.file { color: var(--text-dim); }
+  .file-name { flex: 1; color: var(--text); }
+  .file-name.dir { color: var(--text-bright); font-weight: 500; }
+  .file-meta { color: var(--text-dim); font-size: 11px; }
+  .file-item-parent { color: var(--text-dim); }
+  .file-item-parent .file-name { color: var(--text-dim); }
+
+  /* Modal footer */
+  .modal-foot {
+    padding: 12px 20px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .modal-foot input {
+    flex: 1; font-size: 12px; padding: 6px 10px;
+  }
+  .btn-ghost {
+    background: transparent; color: var(--text-dim); border: 1px solid var(--border);
+    padding: 6px 14px; border-radius: 6px; font-family: inherit;
+    font-size: 12px; cursor: pointer; transition: all 0.2s;
+  }
+  .btn-ghost:hover { border-color: var(--text-dim); color: var(--text); }
+  .btn-green {
+    background: var(--green); color: var(--bg); border: none;
+    padding: 6px 14px; border-radius: 6px; font-family: inherit;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  .btn-green:hover { opacity: 0.85; }
+  .btn-red {
+    background: transparent; color: var(--red); border: 1px solid var(--red);
+    padding: 4px 10px; border-radius: 6px; font-family: inherit;
+    font-size: 11px; cursor: pointer; opacity: 0.7;
+  }
+  .btn-red:hover { opacity: 1; background: rgba(248,81,73,0.1); }
+
+  /* CWD picker row */
+  .cwd-row { display: flex; gap: 8px; align-items: end; }
+  .cwd-row input { flex: 1; }
+  .btn-browse {
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); padding: 8px 12px; border-radius: 6px;
+    font-family: inherit; font-size: 13px; cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-browse:hover { border-color: var(--cyan); color: var(--cyan); }
+
+  .new-folder-row {
+    padding: 8px 20px; display: none; gap: 8px; align-items: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .new-folder-row.open { display: flex; }
+  .new-folder-row input { flex: 1; font-size: 12px; padding: 5px 10px; }
 </style>
 </head>
 <body>
@@ -302,7 +520,9 @@ const HTML = `<!DOCTYPE html>
     <details style="margin-top:12px">
       <summary style="font-size:12px;color:var(--text-dim);cursor:pointer">Options</summary>
       <div class="opts" style="margin-top:12px">
-        <div><label>Working Directory</label><input id="opt-cwd" placeholder="(current dir)"></div>
+        <div><label>Working Directory</label>
+          <div class="cwd-row"><input id="opt-cwd" placeholder="(current dir)"><button class="btn-browse" onclick="openBrowser()">Browse</button></div>
+        </div>
         <div><label>Eval Model</label><input id="opt-model" placeholder="openai/gpt-4o-mini"></div>
         <div><label>Agent Model</label><input id="opt-agent" placeholder="e.g. openai/gpt-5.4"></div>
         <div><label>Reasoning</label>
@@ -321,6 +541,28 @@ const HTML = `<!DOCTYPE html>
 
   <div id="jobs" class="jobs-list"></div>
   <div class="empty" id="empty-msg">No jobs yet. Enter a task above to start.</div>
+</div>
+
+<!-- File Browser Modal -->
+<div class="modal-overlay" id="fb-modal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="fb-title">Browse Folders</h3>
+      <button class="modal-close" onclick="closeBrowser()">&times;</button>
+    </div>
+    <div class="breadcrumbs" id="fb-breadcrumbs"></div>
+    <div class="new-folder-row" id="fb-newfolder">
+      <input id="fb-newfolder-name" placeholder="new folder name...">
+      <button class="btn-green" onclick="createFolder()">Create</button>
+      <button class="btn-ghost" onclick="toggleNewFolder(false)">Cancel</button>
+    </div>
+    <div class="file-list" id="fb-list"></div>
+    <div class="modal-foot">
+      <input id="fb-path" readonly>
+      <button class="btn-ghost" onclick="toggleNewFolder(true)">New Folder</button>
+      <button class="btn-green" onclick="selectFolder()">Select</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -373,9 +615,11 @@ function addJobCard(id, task, status) {
   const card = document.createElement('div');
   card.className = 'job-card';
   card.id = 'card-' + id;
+  const showStop = status === 'running' ? '' : ' hidden';
   card.innerHTML = \`
     <div class="job-head" onclick="toggleJob('\${id}')">
       <span class="job-task">\${esc(task)}</span>
+      <button class="btn-stop\${showStop}" id="stop-\${id}" onclick="event.stopPropagation();stopJob('\${id}')">Stop</button>
       <span class="job-badge badge-\${status}" id="badge-\${id}">\${status}</span>
     </div>
     <div class="progress-bar"><div class="progress-fill" id="prog-\${id}" style="width:0%"></div></div>
@@ -500,6 +744,18 @@ function updateBadge(id, status) {
   }
   const prog = document.getElementById('prog-' + id);
   if (prog) prog.style.width = '100%';
+  const stopBtn = document.getElementById('stop-' + id);
+  if (stopBtn) stopBtn.classList.add('hidden');
+}
+
+async function stopJob(id) {
+  const stopBtn = document.getElementById('stop-' + id);
+  if (stopBtn) { stopBtn.disabled = true; stopBtn.textContent = 'Stopping...'; }
+  try {
+    await fetch('/api/jobs/' + id + '/stop', { method: 'POST' });
+  } catch (err) {
+    alert('Failed to stop: ' + err.message);
+  }
 }
 
 function esc(s) {
@@ -515,6 +771,172 @@ fetch('/api/jobs').then(r => r.json()).then(list => {
     addJobCard(j.id, j.task, j.status);
   }
 }).catch(() => {});
+
+// ── File Browser ──
+let fbCurrentPath = '';
+
+function openBrowser() {
+  document.getElementById('fb-modal').classList.add('open');
+  const cwdVal = document.getElementById('opt-cwd').value.trim();
+  if (cwdVal) {
+    navigateTo(cwdVal);
+  } else {
+    fetch('/api/fs/home').then(r => r.json()).then(d => {
+      navigateTo(d.cwd || d.home);
+    });
+  }
+}
+
+function closeBrowser() {
+  document.getElementById('fb-modal').classList.remove('open');
+  toggleNewFolder(false);
+}
+
+// Close modal on overlay click
+document.getElementById('fb-modal').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('fb-modal')) closeBrowser();
+});
+
+async function navigateTo(dirPath) {
+  try {
+    const res = await fetch('/api/fs/list?path=' + encodeURIComponent(dirPath));
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    fbCurrentPath = data.path;
+    document.getElementById('fb-path').value = data.path;
+    renderBreadcrumbs(data.path);
+    renderFileList(data);
+  } catch (err) {
+    alert('Failed to browse: ' + err.message);
+  }
+}
+
+function renderBreadcrumbs(fullPath) {
+  const el = document.getElementById('fb-breadcrumbs');
+  el.innerHTML = '';
+  const parts = fullPath.split('/').filter(Boolean);
+  // Root
+  const rootBtn = document.createElement('button');
+  rootBtn.className = 'bc-seg';
+  rootBtn.textContent = '/';
+  rootBtn.onclick = () => navigateTo('/');
+  el.appendChild(rootBtn);
+
+  let accumulated = '';
+  for (let i = 0; i < parts.length; i++) {
+    accumulated += '/' + parts[i];
+    const sep = document.createElement('span');
+    sep.className = 'bc-sep';
+    sep.textContent = '/';
+    el.appendChild(sep);
+
+    const btn = document.createElement('button');
+    btn.className = 'bc-seg';
+    btn.textContent = parts[i];
+    const navPath = accumulated;
+    btn.onclick = () => navigateTo(navPath);
+    el.appendChild(btn);
+  }
+}
+
+function renderFileList(data) {
+  const el = document.getElementById('fb-list');
+  el.innerHTML = '';
+
+  // Parent directory entry
+  if (data.parent && data.parent !== data.path) {
+    const row = document.createElement('div');
+    row.className = 'file-item file-item-parent';
+    row.innerHTML = '<span class="file-icon dir">..</span><span class="file-name">parent directory</span>';
+    row.onclick = () => navigateTo(data.parent);
+    el.appendChild(row);
+  }
+
+  if (data.items.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding:24px 20px;color:var(--text-dim);font-size:12px;text-align:center';
+    empty.textContent = 'Empty directory';
+    el.appendChild(empty);
+    return;
+  }
+
+  for (const item of data.items) {
+    const row = document.createElement('div');
+    row.className = 'file-item';
+
+    const icon = document.createElement('span');
+    icon.className = 'file-icon ' + (item.isDir ? 'dir' : 'file');
+    icon.textContent = item.isDir ? '📁' : '📄';
+
+    const name = document.createElement('span');
+    name.className = 'file-name' + (item.isDir ? ' dir' : '');
+    name.textContent = item.name;
+
+    const meta = document.createElement('span');
+    meta.className = 'file-meta';
+    if (!item.isDir && item.size > 0) {
+      meta.textContent = formatSize(item.size);
+    }
+
+    row.appendChild(icon);
+    row.appendChild(name);
+    row.appendChild(meta);
+
+    if (item.isDir) {
+      row.onclick = () => navigateTo(item.path);
+    }
+
+    el.appendChild(row);
+  }
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function selectFolder() {
+  document.getElementById('opt-cwd').value = fbCurrentPath;
+  closeBrowser();
+}
+
+function toggleNewFolder(show) {
+  const row = document.getElementById('fb-newfolder');
+  const input = document.getElementById('fb-newfolder-name');
+  if (show) {
+    row.classList.add('open');
+    input.value = '';
+    input.focus();
+  } else {
+    row.classList.remove('open');
+  }
+}
+
+// Enter key in new folder input
+document.getElementById('fb-newfolder-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') createFolder();
+  if (e.key === 'Escape') toggleNewFolder(false);
+});
+
+async function createFolder() {
+  const name = document.getElementById('fb-newfolder-name').value.trim();
+  if (!name) return;
+  const newPath = fbCurrentPath + '/' + name;
+  try {
+    const res = await fetch('/api/fs/mkdir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: newPath }),
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    toggleNewFolder(false);
+    navigateTo(fbCurrentPath); // refresh
+  } catch (err) {
+    alert('Failed to create folder: ' + err.message);
+  }
+}
 </script>
 </body>
 </html>`;

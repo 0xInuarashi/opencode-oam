@@ -120,6 +120,9 @@ export class Manager extends EventEmitter {
   private agentModel: string | undefined;
   private reasoning: string;
 
+  /** Set to true when stop() is called — checked between turns to bail out early */
+  private stopped = false;
+
   constructor(opts: ManagerOptions) {
     super();
     this.task = opts.task;
@@ -356,7 +359,7 @@ export class Manager extends EventEmitter {
     let prompt = this.initialPrompt(brief);
     let turn = 0;
 
-    while (turn < this.maxTurns) {
+    while (turn < this.maxTurns && !this.stopped) {
       turn++;
       const pct = Math.round((turn / this.maxTurns) * 20);
       const bar2 = `${C.cyan}${"█".repeat(pct)}${C.dim}${"░".repeat(20 - pct)}${C.reset}`;
@@ -434,7 +437,7 @@ export class Manager extends EventEmitter {
 
     // Step 7: Print the progress report and clean up
     this.printReport();
-    this.client.destroy();
+    if (!this.stopped) this.client.destroy();
   }
 
   /**
@@ -877,6 +880,14 @@ export class Manager extends EventEmitter {
     console.log(`${C.bold}  ${total} turn${total !== 1 ? "s" : ""}${C.reset}  ${C.gray}·${C.reset}  ${outcome}`);
     console.log(bar);
     console.log();
+  }
+
+  /** Stops the job early — kills the OpenCode subprocess and sets the stopped flag */
+  stop(): void {
+    this.stopped = true;
+    this.client.destroy();
+    this.log2(`${C.yellow}⚠${C.reset}  job stopped by user`);
+    this.webEvent("done", { summary: "Stopped by user", turns: this.history.length });
   }
 
   /** Strips ANSI escape codes from a string */
